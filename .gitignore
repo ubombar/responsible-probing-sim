@@ -3,3 +3,6 @@ flake.lock
 
 # JSON files
 sim/**/*.json
+
+# PNG files
+sim/**/*.png
