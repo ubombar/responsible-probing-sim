@@ -125,11 +125,11 @@ class AddressImpactMapEntry:
             )
             remaining = impact_cap
             n = len(probs)
-            for v in probs:
+            for i, v in enumerate(probs):
                 if remaining <= 0:
                     v.issuance_prob = 0.0
                 else:
-                    share = remaining / n
+                    share = remaining / (n - i)
                     if v.issuance_prob > share:
                         v.issuance_prob = share
                     remaining -= v.issuance_prob
@@ -188,7 +188,7 @@ class Scheduler:
         if not pds:
             raise ValueError("pds cannot be empty")
         if issue_rate <= 0:
-            raise ValueError("issue_rate must be positive")
+            raise ValueError("issue_rate must have a positive non-zero value")
 
         self._directive_map: dict[int, DirectiveMapEntry] = {
             pd.probing_directive_id: DirectiveMapEntry(directive=pd) for pd in pds
@@ -361,7 +361,7 @@ class Prober:
         """Return the IP at hop `ttl`, or None if the path is too short."""
         if ttl < len(path):
             return path[ttl]
-        return None
+        return path[-1]  # reply from the host
 
     def probe(self, pd: ProbingDirective) -> Optional[ForwardingInfoElement]:
         """
@@ -508,16 +508,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--duration",
         type=float,
-        default=5.0,
+        default=10.0,
         help="Simulation duration in wall-clock seconds",
     )
     parser.add_argument(
-        "--issue-rate", type=float, default=10.0, help="Probes issued per second"
+        "--issue-rate", type=float, default=40.0, help="Probes issued per second"
     )
     parser.add_argument(
         "--impact-cap",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Max active directives per address",
     )
     parser.add_argument(
