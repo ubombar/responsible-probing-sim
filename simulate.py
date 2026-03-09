@@ -125,14 +125,15 @@ class AddressImpactMapEntry:
             )
             remaining = impact_cap
             n = len(probs)
-            for i, v in enumerate(probs):
+            for _, v in enumerate(probs):
                 if remaining <= 0:
                     v.issuance_prob = 0.0
                 else:
-                    share = remaining / (n - i)
+                    share = remaining / (n)
                     if v.issuance_prob > share:
                         v.issuance_prob = share
                     remaining -= v.issuance_prob
+                n -= 1
 
 
 class AddressImpactMap:
@@ -517,13 +518,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--impact-cap",
         type=float,
-        default=1.0,
+        default=0.5,
         help="Max active directives per address",
     )
     parser.add_argument(
         "--loss-prob",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Probability of a probe receiving no reply (0.0-1.0)",
     )
     parser.add_argument(
