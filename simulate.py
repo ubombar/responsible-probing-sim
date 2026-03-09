@@ -62,6 +62,169 @@ class SimulationEvent:
 
 
 # ---------------------------------------------------------------------------
+# RPDemo  (dynamic responsible probing algorithm)
+# ---------------------------------------------------------------------------
+
+
+class RPDemo:
+    def __init__(self, num_dirs: int, impact_capacity: float):
+        self._B: dict[str, set[int]] = dict()
+        self._R: dict[str, float] = dict()
+        self._Br: dict[int, set[str]] = {i: set() for i in range(num_dirs)}
+        self._p: dict[int, float] = {i: 1.0 for i in range(num_dirs)}
+        self._C: float = impact_capacity
+
+    def add(self, directive_id: int, address: str) -> None:
+        """
+        add takes two arguments, directive_id and address and adds the
+        value to the B and Br matrix, updates the residuals.
+        """
+        # return if directive_id does not exist
+        if not self.get_probability(directive_id):
+            return
+
+        # if the address or directive_id is already there then return
+        if address in self._Br.get(directive_id, set()) or directive_id in self._B.get(
+            address, set()
+        ):
+            return
+
+        # populate the address if this is seen just now.
+        self._B[address] = self._B.get(address, set())
+        self._R[address] = self._R.get(address, self._C)
+
+        # start mutating the state
+        # add the impact to the current address.
+        self._Br[directive_id].add(address)
+        self._B[address].add(directive_id)
+
+        # reduce the residual, if it is positive, we are done!
+        if self._R[address] - self._p[directive_id] >= 0:
+            self._R[address] -= self._p[directive_id]
+            return
+
+        # set the current residual to zero meaning we are at max capacity.
+        self._R[address] = 0.0
+        extra_residual = self._p[directive_id] - self._R[address]
+
+        # get the directive_ids that has an impact on this address.
+        current_directive_probs = {d: self._p[d] for d in self._B[address]}
+        self._distribute_extra_residual(extra_residual, current_directive_probs)
+
+    def remove(self, directive_id: int, address: str) -> None:
+        """
+        remove takes two arguments, directive_id and address and removes the
+        value to the B and Br matrix, updates the residuals.
+        """
+        # return if directive_id does not exist
+        if not self.get_probability(directive_id):
+            return
+
+        # if the address or directive_id is not there then return
+        if address not in self._Br.get(
+            directive_id, set()
+        ) or directive_id not in self._B.get(address, set()):
+            return
+
+        # populate the address if this is seen just now.
+        self._B[address] = self._B.get(address, set())
+        self._R[address] = self._R.get(address, self._C)
+
+        # start mutating the state
+        # remove the impact to the current address.
+        self._Br[directive_id].remove(address)
+        self._B[address].remove(directive_id)
+
+        # recover the residual, capped at C
+        recovered = self._p[directive_id]
+        self._R[address] = min(self._R[address] + self._p[directive_id], self._C)
+
+        # redistribute recovered residual to other directives at this address
+        if self._B[address]:
+            current_directive_probs = {d: self._p[d] for d in self._B[address]}
+            directive_limits = {
+                d: min(self._R[a] for a in self._Br[d]) for d in current_directive_probs
+            }
+            self._redistribute_recovered_residual(
+                recovered, current_directive_probs, directive_limits
+            )
+
+        # clean up if address is now empty
+        if not self._B[address]:
+            del self._B[address]
+            del self._R[address]
+
+    def get_probability(self, directive_id: int) -> float | None:
+        """
+        get_probability returns the probability of the provided directive_id.
+        If the directive_id does not exist, then None is returned.
+        """
+        return self._p.get(directive_id, None)
+
+    def _distribute_extra_residual(
+        self,
+        extra_residual: float,
+        directive_probs: dict[int, float],
+        tol: float = 1e-12,
+    ) -> None:
+        """
+        Water-fill: reduce probabilities of directives to absorb extra_residual.
+        In each round, share is split equally; directives that would go below 0
+        are floored at 0 and drop out, their leftover recycled into the next round.
+        """
+        candidates = dict(directive_probs)
+
+        while extra_residual > tol and candidates:
+            share = extra_residual / len(candidates)
+            next_candidates = {}
+            leftover = 0.0
+
+            for d, prob in candidates.items():
+                if share >= prob:
+                    leftover += share - prob
+                    self._p[d] = 0.0
+                else:
+                    self._p[d] -= share
+                    next_candidates[d] = self._p[d]
+
+            extra_residual = leftover
+            candidates = next_candidates
+
+    def _redistribute_recovered_residual(
+        self,
+        recovered: float,
+        directive_probs: dict[int, float],
+        directive_limits: dict[int, float],
+        tol: float = 1e-12,
+    ) -> None:
+        """
+        Water-fill in reverse: distribute recovered residual by increasing
+        probabilities equally, capped at each directive's minimum residual limit.
+        """
+        candidates = dict(directive_probs)
+
+        while recovered > tol and candidates:
+            share = recovered / len(candidates)
+            min_limit = min(directive_limits[d] for d in candidates)
+
+            if share >= min_limit:
+                next_candidates = {}
+                for d in candidates:
+                    if directive_limits[d] == min_limit:
+                        self._p[d] += min_limit
+                        recovered -= min_limit
+                    else:
+                        next_candidates[d] = candidates[d]
+                        directive_limits[d] -= min_limit
+                        self._p[d] += min_limit
+                candidates = next_candidates
+            else:
+                for d in candidates:
+                    self._p[d] += share
+                recovered = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Randomizer  (Fisher-Yates, mirrors the Go implementation)
 # ---------------------------------------------------------------------------
 
@@ -108,71 +271,8 @@ class Randomizer:
 @dataclass
 class DirectiveMapEntry:
     directive: ProbingDirective
-    issuance_prob: float = 1.0
     last_hit_near_address: Optional[str] = None
     last_hit_far_address: Optional[str] = None
-
-
-@dataclass
-class AddressImpactMapEntry:
-    directives: dict[int, DirectiveMapEntry] = field(default_factory=dict)
-
-    def normalize_greedy(self, impact_cap: float) -> None:
-        """Redistribute issuance probabilities so total impact <= impact_cap."""
-        if float(len(self.directives)) > impact_cap:
-            probs = sorted(
-                self.directives.values(), key=lambda e: e.issuance_prob, reverse=True
-            )
-            remaining = impact_cap
-            n = len(probs)
-            for _, v in enumerate(probs):
-                if remaining <= 0:
-                    v.issuance_prob = 0.0
-                else:
-                    share = remaining / (n)
-                    if v.issuance_prob > share:
-                        v.issuance_prob = share
-                    remaining -= v.issuance_prob
-                n -= 1
-
-
-class AddressImpactMap:
-    def __init__(self) -> None:
-        self._map: dict[str, AddressImpactMapEntry] = {}
-
-    def update_and_normalize(
-        self,
-        old_address: Optional[str],
-        new_address: Optional[str],
-        entry: DirectiveMapEntry,
-        impact_cap: float,
-    ) -> None:
-        if old_address == new_address:
-            return
-
-        # Remove from old address bucket
-        if old_address is not None and old_address in self._map:
-            bucket = self._map[old_address]
-            bucket.directives.pop(entry.directive.probing_directive_id, None)
-            if not bucket.directives:
-                del self._map[old_address]
-
-        # Insert into new address bucket and normalize
-        if new_address is not None:
-            if new_address not in self._map:
-                self._map[new_address] = AddressImpactMapEntry(
-                    directives={entry.directive.probing_directive_id: entry}
-                )
-            else:
-                self._map[new_address].directives[
-                    entry.directive.probing_directive_id
-                ] = entry
-            self._map[new_address].normalize_greedy(impact_cap)
-
-    def impact_count(self, address: Optional[str]) -> Optional[int]:
-        if address is None or address not in self._map:
-            return None
-        return len(self._map[address].directives)
 
 
 class Scheduler:
@@ -185,6 +285,7 @@ class Scheduler:
         seed: int,
         issue_rate: float,  # probes per second
         pds: list[ProbingDirective],
+        impact_cap: float,
     ) -> None:
         if not pds:
             raise ValueError("pds cannot be empty")
@@ -194,7 +295,7 @@ class Scheduler:
         self._directive_map: dict[int, DirectiveMapEntry] = {
             pd.probing_directive_id: DirectiveMapEntry(directive=pd) for pd in pds
         }
-        self._address_impact_map = AddressImpactMap()
+        self._rp = RPDemo(num_dirs=len(pds), impact_capacity=impact_cap)
         self._issue_period = 1.0 / issue_rate
         self._last_issue: float = 0.0
         self._randomizer = Randomizer(seed, list(self._directive_map.keys()))
@@ -213,7 +314,7 @@ class Scheduler:
 
         return entry.directive
 
-    def update(self, fie: ForwardingInfoElement, impact_cap: float) -> None:
+    def update(self, fie: ForwardingInfoElement) -> None:
         """Update address impact bookkeeping after receiving a FIE."""
         entry = self._directive_map.get(fie.probing_directive_id)
         if entry is None:
@@ -225,24 +326,24 @@ class Scheduler:
         entry.last_hit_near_address = fie.near_addr
         entry.last_hit_far_address = fie.far_addr
 
-        self._address_impact_map.update_and_normalize(
-            old_near, fie.near_addr, entry, impact_cap
-        )
-        self._address_impact_map.update_and_normalize(
-            old_far, fie.far_addr, entry, impact_cap
-        )
+        # Remove old addresses if changed
+        if old_near != fie.near_addr and old_near is not None:
+            self._rp.remove(fie.probing_directive_id, old_near)
+        if old_far != fie.far_addr and old_far is not None:
+            self._rp.remove(fie.probing_directive_id, old_far)
 
-    def issuance_prob(self, pd_id: int) -> float:
-        return self._directive_map[pd_id].issuance_prob
+        # Add new addresses
+        if fie.near_addr is not None:
+            self._rp.add(fie.probing_directive_id, fie.near_addr)
+        if fie.far_addr is not None:
+            self._rp.add(fie.probing_directive_id, fie.far_addr)
 
-    def impact_count(self, address: Optional[str]) -> Optional[int]:
-        return self._address_impact_map.impact_count(address)
+    def issuance_prob(self, pd_id: int) -> float | None:
+        return self._rp.get_probability(pd_id)
 
     def snapshot_issuance_probs(self) -> dict[int, float]:
         """Return a snapshot of {directive_id: issuance_prob} for all directives."""
-        return {
-            pd_id: entry.issuance_prob for pd_id, entry in self._directive_map.items()
-        }
+        return {pd_id: self._rp.get_probability(pd_id) for pd_id in self._directive_map}
 
     def snapshot_impact_table(self) -> dict[str, dict[int, float]]:
         """
@@ -250,11 +351,14 @@ class Scheduler:
             { address: { directive_id: issuance_prob, ... }, ... }
         """
         return {
-            address: {
-                pd_id: entry.issuance_prob for pd_id, entry in bucket.directives.items()
-            }
-            for address, bucket in self._address_impact_map._map.items()
+            address: {d: self._rp.get_probability(d) for d in directive_ids}
+            for address, directive_ids in self._rp._B.items()
         }
+
+    def impact_count(self, address: Optional[str]) -> Optional[int]:
+        if address is None or address not in self._rp._B:
+            return None
+        return len(self._rp._B[address])
 
 
 # ---------------------------------------------------------------------------
@@ -298,23 +402,8 @@ class Prober:
     """
     Simulates sending TTL-limited probes through a network described by a
     forwarding table.
-
-    The forwarding table has the structure:
-        router_ip -> destination_ip -> [next_hop_ip, ...]
-
-    When a packet is forwarded at each hop, one next hop is chosen randomly
-    from the list (ECMP). This choice is made independently at every hop and
-    every probe, so different probes to the same destination may take different
-    paths.
-
-    For a given ProbingDirective (destination_addr, near_ttl):
-      - Probe at near_ttl   -> IP of the router at that hop
-      - Probe at near_ttl+1 -> IP of the router at the next hop
-
-    If the Bernoulli experiment fails, returns None (packet loss / no reply).
     """
 
-    # The source is the ingress router from which all probes originate.
     SOURCE_IP = "10.0.0.1"
 
     def __init__(
@@ -328,57 +417,34 @@ class Prober:
         self._loss_prob = loss_prob
 
     def _follow_path(self, destination: str, max_ttl: int) -> list[str]:
-        """
-        Simulate a packet traversal from SOURCE_IP toward destination,
-        recording the IP at each hop up to max_ttl.
-
-        At each router, the next hop is resolved as follows:
-          1. Look up the destination IP specifically.
-          2. If not found, fall back to the "*" default gateway entry.
-          3. If neither exists, the path ends (no route).
-
-        One next hop is chosen randomly from the matched list (ECMP).
-        Returns a list of router IPs visited, starting from SOURCE_IP.
-        """
         path: list[str] = [self.SOURCE_IP]
         current = self.SOURCE_IP
 
         for _ in range(max_ttl):
             router_table = self._table.get(current)
             if router_table is None:
-                break  # router not in table, path ends
-            # Specific route first, then default gateway wildcard
+                break
             next_hops = router_table.get(destination) or router_table.get("*")
             if not next_hops:
-                break  # no route and no default gateway
+                break
             current = self._rng.choice(next_hops)
             path.append(current)
             if current == destination:
-                break  # reached destination
+                break
 
         return path
 
     def _hop_ip(self, path: list[str], ttl: int) -> Optional[str]:
-        """Return the IP at hop `ttl`, or None if the path is too short."""
         if ttl < len(path):
             return path[ttl]
-        return path[-1]  # reply from the host
+        return path[-1]
 
     def probe(self, pd: ProbingDirective) -> Optional[ForwardingInfoElement]:
-        """
-        Issue two probes (near_ttl and near_ttl+1) toward the destination.
-        Each probe independently follows the forwarding table hop-by-hop,
-        picking randomly among equal-cost next hops at each router.
-        Returns a FIE, or None if the Bernoulli experiment fails.
-        """
         if self._rng.random() < self._loss_prob:
             return None
 
         far_ttl = pd.near_ttl + 1
-
-        # Walk the path far enough to cover both TTLs in one traversal.
         path = self._follow_path(pd.destination_addr, far_ttl)
-
         near_addr = self._hop_ip(path, pd.near_ttl)
         far_addr = self._hop_ip(path, far_ttl)
 
@@ -405,10 +471,10 @@ class Simulator:
     def __init__(
         self,
         seed: int,
-        duration: float,  # seconds to run
-        issue_rate: float,  # probes per second
-        impact_cap: float,  # max probes per address
-        loss_prob: float,  # probability of probe getting no reply
+        duration: float,
+        issue_rate: float,
+        impact_cap: float,
+        loss_prob: float,
         forwarding_table: ForwardingTable,
         pds: list[ProbingDirective],
         output_path: str = "simulation_results.json",
@@ -417,16 +483,13 @@ class Simulator:
         self._impact_cap = impact_cap
         self._output_path = output_path
 
-        # Single shared RNG for everything except the scheduler's randomizer
-        # (scheduler uses its own seeded RNG internally via Randomizer)
         self._rng = random.Random(seed + 1)
-
         self._prober = Prober(forwarding_table, self._rng, loss_prob)
-        self._scheduler = Scheduler(seed=seed, issue_rate=issue_rate, pds=pds)
+        self._scheduler = Scheduler(
+            seed=seed, issue_rate=issue_rate, pds=pds, impact_cap=impact_cap
+        )
         self._events: list[SimulationEvent] = []
-        # Cumulative probe hit counter per IP address, across all events
         self._cumulative_impacts: dict[str, int] = {}
-        # Simulation parameters saved verbatim into the output JSON
         self._params: dict = {}
 
     def run(self) -> None:
@@ -442,20 +505,18 @@ class Simulator:
 
             # 2. Send probes via prober
             fie = self._prober.probe(pd)
-
             probe_success = fie is not None
 
             # 3. Update scheduler only on success
             if probe_success:
-                self._scheduler.update(fie, self._impact_cap)
-                # Increment cumulative hit counters for near and far addresses
+                self._scheduler.update(fie)
                 for addr in (fie.near_addr, fie.far_addr):
                     if addr is not None:
                         self._cumulative_impacts[addr] = (
                             self._cumulative_impacts.get(addr, 0) + 1
                         )
 
-            # 4. Record event — snapshot the full cumulative impact map
+            # 4. Record event
             event = SimulationEvent(
                 event_id=event_id,
                 wall_time=round(wall_time, 6),
@@ -503,48 +564,14 @@ if __name__ == "__main__":
         description="Retina responsible prober simulation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="RNG seed for deterministic runs"
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=10.0,
-        help="Simulation duration in wall-clock seconds",
-    )
-    parser.add_argument(
-        "--issue-rate", type=float, default=40.0, help="Probes issued per second"
-    )
-    parser.add_argument(
-        "--impact-cap",
-        type=float,
-        default=0.5,
-        help="Max active directives per address",
-    )
-    parser.add_argument(
-        "--loss-prob",
-        type=float,
-        default=0.05,
-        help="Probability of a probe receiving no reply (0.0-1.0)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="./sim/results/results.json",
-        help="Path for the JSON output file",
-    )
-    parser.add_argument(
-        "--topology",
-        type=str,
-        default="./sim/topology/topology.json",
-        help="Path to the forwarding table JSON (produced by generate_topology.py)",
-    )
-    parser.add_argument(
-        "--pds",
-        type=str,
-        default="./sim/pds/pds.json",
-        help="Path to the probing directives JSON (produced by generate_pds.py)",
-    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--duration", type=float, default=10.0)
+    parser.add_argument("--issue-rate", type=float, default=40.0)
+    parser.add_argument("--impact-cap", type=float, default=0.5)
+    parser.add_argument("--loss-prob", type=float, default=0.05)
+    parser.add_argument("--output", type=str, default="./sim/results/results.json")
+    parser.add_argument("--topology", type=str, default="./sim/topology/topology.json")
+    parser.add_argument("--pds", type=str, default="./sim/pds/pds.json")
     args = parser.parse_args()
 
     forwarding_table = load_forwarding_table(args.topology)
@@ -560,14 +587,5 @@ if __name__ == "__main__":
         pds=pds,
         output_path=args.output,
     )
-    sim._params = {
-        "seed": args.seed,
-        "duration": args.duration,
-        "issue_rate": args.issue_rate,
-        "impact_cap": args.impact_cap,
-        "loss_prob": args.loss_prob,
-        "topology": args.topology,
-        "pds": args.pds,
-        "output": args.output,
-    }
+    sim._params = vars(args)
     sim.run()
